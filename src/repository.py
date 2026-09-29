@@ -65,6 +65,20 @@ class Repository:
                     entry_hash TEXT NOT NULL UNIQUE,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS dependencies (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    upstream_item_id INTEGER NOT NULL REFERENCES items(id),
+                    downstream_item_id INTEGER NOT NULL REFERENCES items(id),
+                    shared_part TEXT NOT NULL,
+                    basis TEXT NOT NULL,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(upstream_item_id, downstream_item_id)
+                );
+                CREATE INDEX IF NOT EXISTS ix_dependencies_down
+                    ON dependencies(downstream_item_id);
+                CREATE INDEX IF NOT EXISTS ix_dependencies_up
+                    ON dependencies(upstream_item_id);
             """)
 
     @staticmethod
@@ -156,6 +170,76 @@ class Repository:
                 (item_id,),
             ).fetchone()
         return int(row["n"])
+
+    # ---- 结构依赖关系存储 ----
+    @staticmethod
+    def _dependency(row: sqlite3.Row) -> Dict[str, Any]:
+        return dict(row)
+
+    def add_dependency(self, upstream_id: int, downstream_id: int, shared_part: str,
+                       basis: str, actor: str, cycle_detector) -> Dict[str, Any]:
+        """登记一条依赖边。查重与成环判断在同一把锁、同一事务内完成，
+        并发登记无法绕过成环检查；cycle_detector由rules层提供（判断与存储分离）。"""
+        now = utc_now()
+        with self._lock, self.conn:
+            if self.conn.execute("SELECT 1 FROM items WHERE id=?", (upstream_id,)).fetchone() is None:
+                raise NotFoundError("上游项目不存在")
+            if self.conn.execute("SELECT 1 FROM items WHERE id=?", (downstream_id,)).fetchone() is None:
+                raise NotFoundError("下游项目不存在")
+            duplicate = self.conn.execute(
+                "SELECT id FROM dependencies WHERE upstream_item_id=? AND downstream_item_id=?",
+                (upstream_id, downstream_id),
+            ).fetchone()
+            if duplicate is not None:
+                raise ConflictError("该结构依赖关系已登记，同一关系只保留一条")
+            rows = self.conn.execute(
+                "SELECT upstream_item_id, downstream_item_id FROM dependencies"
+            ).fetchall()
+            cycle = cycle_detector(
+                [(int(r["upstream_item_id"]), int(r["downstream_item_id"])) for r in rows],
+                upstream_id, downstream_id,
+            )
+            if cycle:
+                raise ConflictError("依赖关系成环，拒绝登记", details={"cycle": cycle})
+            cur = self.conn.execute(
+                """INSERT INTO dependencies(upstream_item_id, downstream_item_id, shared_part,
+                   basis, created_by, created_at) VALUES(?,?,?,?,?,?)""",
+                (upstream_id, downstream_id, shared_part, basis, actor, now),
+            )
+            dep_id = int(cur.lastrowid)
+        return self.get_dependency(dep_id)
+
+    def get_dependency(self, dep_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute(self._DEPENDENCY_SQL + " WHERE d.id=?", (dep_id,)).fetchone()
+        if row is None:
+            raise NotFoundError("依赖关系不存在")
+        return self._dependency(row)
+
+    def list_dependencies(self, downstream_item_id: Optional[int] = None,
+                          upstream_item_id: Optional[int] = None) -> List[Dict[str, Any]]:
+        sql = self._DEPENDENCY_SQL
+        clauses: List[str] = []
+        params: List[Any] = []
+        if downstream_item_id is not None:
+            clauses.append("d.downstream_item_id=?"); params.append(downstream_item_id)
+        if upstream_item_id is not None:
+            clauses.append("d.upstream_item_id=?"); params.append(upstream_item_id)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY d.id"
+        with self._lock:
+            rows = self.conn.execute(sql, tuple(params)).fetchall()
+        return [self._dependency(row) for row in rows]
+
+    _DEPENDENCY_SQL = (
+        "SELECT d.id, d.upstream_item_id, d.downstream_item_id, d.shared_part, d.basis, "
+        "d.created_by, d.created_at, u.title AS upstream_title, u.status AS upstream_status, "
+        "dn.title AS downstream_title, dn.status AS downstream_status "
+        "FROM dependencies d "
+        "JOIN items u ON u.id=d.upstream_item_id "
+        "JOIN items dn ON dn.id=d.downstream_item_id"
+    )
 
     def append_audit(self, action: str, entity_type: str, entity_id: int,
                      actor: str, detail: dict) -> Dict[str, Any]:
