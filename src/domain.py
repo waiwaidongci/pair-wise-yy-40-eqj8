@@ -10,13 +10,21 @@ class ValidationError(DomainError): kind=ErrorKind.VALIDATION
 class NotFoundError(DomainError): kind=ErrorKind.NOT_FOUND
 class PermissionDenied(DomainError): kind=ErrorKind.FORBIDDEN
 class ConflictError(DomainError): kind=ErrorKind.CONFLICT
+class CycleError(DomainError):
+    kind=ErrorKind.CONFLICT
+    def __init__(self,message,cycle):
+        super().__init__(message); self.message=message; self.cycle=list(cycle)
 SEVERITIES=['low', 'medium', 'high', 'severe']; STATES=['proposed', 'assessed', 'design', 'construction', 'accepted', 'rejected']; ROLES=['assessor', 'structural_engineer', 'review_board', 'viewer']
+EDGE_STATUSES=['active', 'invalidated']
 @dataclass(frozen=True)
 class Item:
     id:int; title:str; description:str; severity:str; quantity:float; threshold:float; status:str; version:int; external_ref:Optional[str]; created_by:str; created_at:str; updated_at:str
 @dataclass(frozen=True)
 class Record:
     id:int; item_id:int; kind:str; detail:str; status:str; external_ref:Optional[str]; created_by:str; created_at:str
+@dataclass(frozen=True)
+class Dependency:
+    id:int; upstream_id:int; downstream_id:int; shared_part:str; basis:str; status:str; created_by:str; created_at:str
 @dataclass(frozen=True)
 class AuditEntry:
     id:int; action:str; entity_type:str; entity_id:int; actor:str; detail:Dict[str,Any]; previous_hash:str; entry_hash:str; created_at:str
@@ -36,3 +44,7 @@ def require_number(value,field,minimum=0.0):
     return number
 def ensure_role(role,allowed):
     if role not in allowed: raise PermissionDenied("当前角色无权执行该操作")
+def require_id(value,field):
+    if isinstance(value,bool) or not isinstance(value,int): raise ValidationError(f"{field}必须是正整数")
+    if value<1: raise ValidationError(f"{field}必须是正整数")
+    return value

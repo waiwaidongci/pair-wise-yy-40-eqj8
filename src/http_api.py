@@ -6,8 +6,8 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
-from .domain import (ConflictError, DomainError, NotFoundError, PermissionDenied,
-                     ValidationError)
+from .domain import (ConflictError, CycleError, DomainError, NotFoundError,
+                     PermissionDenied, ValidationError)
 from .service import Service
 
 
@@ -57,6 +57,17 @@ def make_handler(service: Service, static_dir: str):
             return value
 
         def _send_error(self, exc: Exception) -> None:
+            if isinstance(exc, CycleError):
+                status = 409
+                payload = {"error": exc.__class__.__name__,
+                           "message": str(exc), "cycle": exc.cycle}
+                body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             if isinstance(exc, ValidationError):
                 status = 422
             elif isinstance(exc, NotFoundError):
@@ -84,6 +95,15 @@ def make_handler(service: Service, static_dir: str):
                     actor, role = self._identity()
                     del actor
                     self._json(200, {"items": service.list_items(role)})
+                elif path.startswith("/api/items/") and path.endswith("/dependencies"):
+                    item_id = int(path.split("/")[3])
+                    query = parse_qs(urlparse(self.path).query)
+                    direction = (query.get("direction", ["both"])[0])
+                    edge_status = query.get("status", [None])[0]
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, {"dependencies": service.list_dependencies(
+                        item_id, role, direction, edge_status)})
                 elif path.startswith("/api/items/") and path.endswith("/records"):
                     item_id = int(path.split("/")[3])
                     actor, role = self._identity()
@@ -110,6 +130,10 @@ def make_handler(service: Service, static_dir: str):
                 body = self._body()
                 if path == "/api/items":
                     self._json(201, service.create_item(body, actor, role))
+                elif path.startswith("/api/items/") and path.endswith("/dependencies"):
+                    downstream_id = int(path.split("/")[3])
+                    self._json(201, service.register_dependency(
+                        downstream_id, body, actor, role))
                 elif path.startswith("/api/items/") and path.endswith("/records"):
                     item_id = int(path.split("/")[3])
                     self._json(201, service.add_record(item_id, body, actor, role))

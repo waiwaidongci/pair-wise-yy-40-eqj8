@@ -7,7 +7,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .audit import make_entry, utc_now
-from .domain import ConflictError, NotFoundError
+from .domain import ConflictError, CycleError, NotFoundError
+from .dependencies import STARTED_STATES, cycle_for_new_edge
 from .rules import ID_PREFIX, STATES
 
 
@@ -20,6 +21,7 @@ class Repository:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.execute("PRAGMA journal_mode = WAL")
+        self.conn.execute("PRAGMA busy_timeout = 5000")
         self._create_schema()
 
     def _create_schema(self) -> None:
@@ -54,6 +56,20 @@ class Repository:
                     created_at TEXT NOT NULL,
                     UNIQUE(item_id, external_ref)
                 );
+                CREATE TABLE IF NOT EXISTS dependencies (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    upstream_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    downstream_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    shared_part TEXT NOT NULL,
+                    basis TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'active'
+                        CHECK(status IN ('active','invalidated')),
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(upstream_id, downstream_id)
+                );
+                CREATE INDEX IF NOT EXISTS ix_dependencies_downstream
+                    ON dependencies(downstream_id);
                 CREATE TABLE IF NOT EXISTS audit_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     action TEXT NOT NULL,
@@ -156,6 +172,132 @@ class Repository:
                 (item_id,),
             ).fetchone()
         return int(row["n"])
+
+    @staticmethod
+    def _dependency(row: sqlite3.Row) -> Dict[str, Any]:
+        return dict(row)
+
+    def add_dependency(self, upstream_id: int, downstream_id: int,
+                       shared_part: str, basis: str, actor: str) -> Dict[str, Any]:
+        """登记一条 upstream_id -> downstream_id 的依赖边。
+
+        成环检查与插入在同一立即事务内完成，并发登记无法绕过；同一对
+        (upstream_id, downstream_id) 只保留一条，失效后重新登记则重新生效。
+        返回 (边, 是否由失效重新激活)。
+        """
+        now = utc_now()
+        self.get_item(upstream_id)
+        self.get_item(downstream_id)
+        with self._lock:
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                edges = self.conn.execute(
+                    "SELECT upstream_id, downstream_id FROM dependencies WHERE status='active'"
+                ).fetchall()
+                cycle = cycle_for_new_edge(
+                    [(row["upstream_id"], row["downstream_id"]) for row in edges],
+                    upstream_id, downstream_id)
+                if cycle is not None:
+                    self.conn.rollback()
+                    raise CycleError("依赖关系成环，拒绝登记；回路：" + " -> ".join(str(n) for n in cycle), cycle)
+                existing = self.conn.execute(
+                    "SELECT * FROM dependencies WHERE upstream_id=? AND downstream_id=?",
+                    (upstream_id, downstream_id),
+                ).fetchone()
+                if existing is not None and existing["status"] == "active":
+                    self.conn.rollback()
+                    raise ConflictError("该依赖关系已登记，同一关系只保留一条")
+                if existing is None:
+                    cur = self.conn.execute(
+                        """INSERT INTO dependencies(upstream_id, downstream_id, shared_part,
+                           basis, status, created_by, created_at)
+                           VALUES(?,?,?,?, 'active', ?,?)""",
+                        (upstream_id, downstream_id, shared_part, basis, actor, now),
+                    )
+                    reactivated = False
+                    dependency_id = int(cur.lastrowid)
+                else:
+                    dependency_id = int(existing["id"])
+                    self.conn.execute(
+                        """UPDATE dependencies SET shared_part=?, basis=?, status='active',
+                           created_by=?, created_at=? WHERE id=?""",
+                        (shared_part, basis, actor, now, dependency_id),
+                    )
+                    reactivated = True
+                self.conn.commit()
+            except CycleError:
+                raise
+            except ConflictError:
+                raise
+            except Exception:
+                self.conn.rollback()
+                raise
+        row = self.conn.execute("SELECT * FROM dependencies WHERE id=?", (dependency_id,)).fetchone()
+        return self._dependency(row), reactivated
+
+    def list_dependencies(self, item_id: Optional[int] = None,
+                          direction: str = "both",
+                          status: Optional[str] = None) -> List[Dict[str, Any]]:
+        sql = (
+            "SELECT d.*, u.title AS upstream_title, w.title AS downstream_title, "
+            "u.status AS upstream_item_status, w.status AS downstream_item_status "
+            "FROM dependencies d "
+            "JOIN items u ON u.id=d.upstream_id JOIN items w ON w.id=d.downstream_id"
+        )
+        clauses: List[str] = []
+        params: List[Any] = []
+        if item_id is not None:
+            if direction == "upstream":
+                clauses.append("d.downstream_id=?")
+                params.append(item_id)
+            elif direction == "downstream":
+                clauses.append("d.upstream_id=?")
+                params.append(item_id)
+            else:
+                clauses.append("(d.upstream_id=? OR d.downstream_id=?)")
+                params.extend([item_id, item_id])
+        if status is not None:
+            clauses.append("d.status=?")
+            params.append(status)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY d.id"
+        with self._lock:
+            rows = self.conn.execute(sql, tuple(params)).fetchall()
+        return [dict(row) for row in rows]
+
+    def construction_links(self, downstream_id: int) -> List[Dict[str, Any]]:
+        """下游开工所需的全部上游链路（含失效边），附带上游验收状态。"""
+        with self._lock:
+            rows = self.conn.execute(
+                """SELECT d.id, d.upstream_id, d.downstream_id, d.shared_part, d.basis,
+                          d.status AS edge_status, u.status AS status, u.title AS upstream_title
+                   FROM dependencies d JOIN items u ON u.id=d.upstream_id
+                   WHERE d.downstream_id=? ORDER BY d.id""",
+                (downstream_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def invalidate_downstream_edges(self, upstream_id: int) -> List[Dict[str, Any]]:
+        """上游被驳回时，将未开工下游的生效依据标记失效；已施工的记录保留。
+
+        返回被标记为失效的边。
+        """
+        with self._lock, self.conn:
+            rows = self.conn.execute(
+                """SELECT d.* FROM dependencies d JOIN items w ON w.id=d.downstream_id
+                   WHERE d.upstream_id=? AND d.status='active'
+                     AND w.status NOT IN ({started})
+                   ORDER BY d.id""".format(
+                    started=",".join("'" + s + "'" for s in sorted(STARTED_STATES))),
+                (upstream_id,),
+            ).fetchall()
+            for row in rows:
+                self.conn.execute(
+                    "UPDATE dependencies SET status='invalidated' WHERE id=?",
+                    (row["id"],),
+                )
+        return [dict(row) for row in rows]
 
     def append_audit(self, action: str, entity_type: str, entity_id: int,
                      actor: str, detail: dict) -> Dict[str, Any]:

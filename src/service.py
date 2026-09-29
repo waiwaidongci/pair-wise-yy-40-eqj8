@@ -2,12 +2,15 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from .domain import ensure_role, normalize_severity, require_number, require_text
+from .domain import (ConflictError, ensure_role, normalize_severity,
+                     require_id, require_number, require_text)
 from .repository import Repository
-from .rules import (AUDIT_ROLES, CREATE_ROLES, ENTITY, RECORD_ROLES, TITLE,
-                    VIEW_ROLES, completion_blockers, escalation_required,
-                    priority_score, response_deadline_hours, role_for_transition,
+from .rules import (AUDIT_ROLES, CREATE_ROLES, DEPENDENCY_ROLES, ENTITY,
+                    RECORD_ROLES, TITLE, VIEW_ROLES, completion_blockers,
+                    escalation_required, priority_score,
+                    response_deadline_hours, role_for_transition,
                     validate_transition)
+from .dependencies import construction_blockers
 
 
 class Service:
@@ -65,15 +68,64 @@ class Service:
             raise ValueError("expected_version必须是正整数")
         blockers = completion_blockers(target, self.repository.open_record_count(item_id))
         if blockers:
-            from .domain import ConflictError
             raise ConflictError("；".join(blockers))
+        if target == "construction":
+            dep_blockers = construction_blockers(
+                self.repository.construction_links(item_id))
+            if dep_blockers:
+                raise ConflictError("；".join(dep_blockers))
         updated = self.repository.transition_item(item_id, target, expected_version, actor)
         self.repository.append_audit("transition", ENTITY, item_id, actor, {
             "from": item["status"], "to": target,
             "escalation_required": escalation_required(
                 item["severity"], item["quantity"], item["threshold"]),
         })
+        if target == "rejected":
+            invalidated = self.repository.invalidate_downstream_edges(item_id)
+            for edge in invalidated:
+                self.repository.append_audit(
+                    "dependency_invalidated", "结构依赖", edge["id"], actor, {
+                        "upstream_id": edge["upstream_id"],
+                        "downstream_id": edge["downstream_id"],
+                        "shared_part": edge["shared_part"],
+                        "basis": edge["basis"],
+                    })
         return self.enrich(updated)
+
+    def register_dependency(self, downstream_id: int, payload: Dict[str, Any],
+                            actor: str, role: str) -> Dict[str, Any]:
+        """为下游项目登记一个上游项目及共用部位、依据。"""
+        ensure_role(role, DEPENDENCY_ROLES)
+        actor = require_text(actor, "actor", 100)
+        downstream_id = require_id(downstream_id, "downstream_id")
+        upstream_id = require_id(
+            payload.get("upstream_id", payload.get("upstream")), "upstream_id")
+        shared_part = require_text(payload.get("shared_part"), "shared_part", 200)
+        basis = require_text(payload.get("basis"), "basis")
+        edge, reactivated = self.repository.add_dependency(
+            upstream_id, downstream_id, shared_part, basis, actor)
+        self.repository.append_audit(
+            "dependency_reactivated" if reactivated else "dependency_registered",
+            "结构依赖", edge["id"], actor, {
+                "upstream_id": upstream_id, "downstream_id": downstream_id,
+                "shared_part": shared_part, "basis": basis,
+                "reactivated": reactivated,
+            })
+        return edge
+
+    def list_dependencies(self, item_id: int, role: str,
+                          direction: str = "both",
+                          status: Optional[str] = None) -> list:
+        self._view(role)
+        if direction not in ("upstream", "downstream", "both"):
+            from .domain import ValidationError
+            raise ValidationError("direction只能是upstream、downstream或both")
+        if status is not None and status not in ("active", "invalidated"):
+            from .domain import ValidationError
+            raise ValidationError("status只能是active或invalidated")
+        self.repository.get_item(item_id)
+        return self.repository.list_dependencies(item_id, direction, status)
+
 
     def get_item(self, item_id: int, role: str) -> Dict[str, Any]:
         self._view(role)
